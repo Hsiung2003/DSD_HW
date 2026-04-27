@@ -66,14 +66,12 @@ module iter_ctrl #(
   reg [3:0] cur_idx;  // 0..15
 
   // FSM
-  localparam [2:0]
-    S_IDLE  = 3'd0,
-    S_INIT  = 3'd1,
-    S_PREP  = 3'd2,
-    S_CALC  = 3'd3,
-    S_WRITE = 3'd4,
-    S_DONE  = 3'd5;
-  reg [2:0] state;
+  localparam [1:0]
+    IDLE = 2'b00,
+    INIT = 2'b01,
+    RUN = 2'b10,
+    DONE = 2'b11;
+  reg [1:0] state;
 
   // ---- Helpers ----
   function automatic signed [15:0] pick_b(input [3:0] idx);
@@ -107,18 +105,33 @@ module iter_ctrl #(
     end
   endfunction
 
-  // Neighbors for current idx (combinational)
-  wire signed [15:0] bi_cur = pick_b(cur_idx);
-  wire signed [31:0] xim3 = pick_x($signed({1'b0,cur_idx}) - 3);
-  wire signed [31:0] xim2 = pick_x($signed({1'b0,cur_idx}) - 2);
-  wire signed [31:0] xim1 = pick_x($signed({1'b0,cur_idx}) - 1);
-  wire signed [31:0] xip1 = pick_x($signed({1'b0,cur_idx}) + 1);
-  wire signed [31:0] xip2 = pick_x($signed({1'b0,cur_idx}) + 2);
-  wire signed [31:0] xip3 = pick_x($signed({1'b0,cur_idx}) + 3);
+  // Neighbors for issued idx (combinational).
+  // The pipelined core samples inputs on the clock edge when `core_in_valid` is high,
+  // so drive core inputs from a registered issue index.
+  reg  [3:0] issue_idx_r;
+  wire signed [15:0] bi_cur = pick_b(issue_idx_r);
+  wire signed [31:0] xim3 = pick_x($signed({1'b0,issue_idx_r}) - 3);
+  wire signed [31:0] xim2 = pick_x($signed({1'b0,issue_idx_r}) - 2);
+  wire signed [31:0] xim1 = pick_x($signed({1'b0,issue_idx_r}) - 1);
+  wire signed [31:0] xip1 = pick_x($signed({1'b0,issue_idx_r}) + 1);
+  wire signed [31:0] xip2 = pick_x($signed({1'b0,issue_idx_r}) + 2);
+  wire signed [31:0] xip3 = pick_x($signed({1'b0,issue_idx_r}) + 3);
+  
+  reg core_in_valid;
+  wire core_out_valid;
+  reg [3:0] idx_pipe0, idx_pipe1, idx_pipe2;
+  reg        v_pipe0, v_pipe1, v_pipe2;
+  reg [4:0] issued_cnt, commit_cnt;
+  reg [1:0] bubble_cnt;
+  wire [3:0] next_idx = group + (slot << 2);
 
   // Core compute (combinational)
   wire signed [31:0] x_calc;
   core_xi u_core (
+    .clk    (clk),
+    .reset  (reset),
+    .in_valid(core_in_valid),
+    .out_valid(core_out_valid),
     .bi   (bi_cur),
     .x_im3(xim3),
     .x_im2(xim2),
@@ -132,7 +145,13 @@ module iter_ctrl #(
   integer k;
   always @(posedge clk or posedge reset) begin
     if (reset) begin
-      state <= S_IDLE;
+      state <= IDLE;
+      issued_cnt <= 5'd0;
+      commit_cnt <= 5'd0;
+      bubble_cnt <= 2'd0;
+      core_in_valid <= 1'b0;
+      issue_idx_r <= 4'd0;
+
       busy <= 1'b0;
       done <= 1'b0;
       iter_cnt <= 6'd0;
@@ -149,85 +168,99 @@ module iter_ctrl #(
       x8 <= 32'sd0;  x9 <= 32'sd0;  x10 <= 32'sd0; x11 <= 32'sd0;
       x12 <= 32'sd0; x13 <= 32'sd0; x14 <= 32'sd0; x15 <= 32'sd0;
     end else begin
+      // defaults
       done <= 1'b0;
+      core_in_valid <= 1'b0;
+
+      // ---- pipeline bookkeeping: shift + conditional load ----
+      v_pipe2   <= v_pipe1;
+      idx_pipe2 <= idx_pipe1;
+      v_pipe1   <= v_pipe0;
+      idx_pipe1 <= idx_pipe0;
+      if (core_in_valid) begin
+        v_pipe0   <= 1'b1;
+        idx_pipe0 <= issue_idx_r;
+      end else begin
+        v_pipe0   <= 1'b0;
+      end
+      if (core_out_valid && v_pipe2) begin
+        x_new[idx_pipe2] <= x_calc;
+        updated[idx_pipe2] <= 1'b1;
+        commit_cnt <= commit_cnt + 5'd1;
+      end
 
       case (state)
-        S_IDLE: begin
-          busy <= 1'b0;
+        IDLE: begin
+            busy <= 1'b0;
           if (start) begin
-            busy <= 1'b1;
+            state <= INIT;
+            issued_cnt <= 5'd0;
+            commit_cnt <= 5'd0;
+            bubble_cnt <= 2'd0;
             iter_cnt <= 6'd0;
-            group <= 2'd0;
-            slot <= 2'd0;
-            updated <= 16'd0;
-            state <= S_INIT;
           end
         end
-
-        S_INIT: begin
-          // TODO: decide x^0 policy:
-          // - Option A: all zeros
-          // - Option B: x^0 = (b_i <<< 16)/20
-          //
-          // For skeleton, keep zero init (already reset). If you want b/20 init, fill here.
+        INIT: begin
+            busy <= 1'b1;
           for (k = 0; k < 16; k = k + 1) begin
             x_old[k] <= x_new[k];
           end
           updated <= 16'd0;
+          issued_cnt <= 5'd0;
+          commit_cnt <= 5'd0;
+          bubble_cnt <= 2'd0;
           group <= 2'd0;
           slot <= 2'd0;
-          state <= S_PREP;
+          v_pipe0 <= 1'b0;
+          v_pipe1 <= 1'b0;
+          v_pipe2 <= 1'b0;
+          state <= RUN;
         end
 
-        S_PREP: begin
-          // group/slot -> idx = group + 4*slot
-          cur_idx <= group + (slot << 2);
-          state <= S_CALC;
-        end
+        RUN: begin 
+          busy <= 1'b1;
+          if (bubble_cnt != 2'd0) begin
+            bubble_cnt <= bubble_cnt - 2'd1;
+          end else if (issued_cnt < 5'd16) begin // issue next
+            cur_idx <= next_idx;
+            issue_idx_r <= next_idx;
+            core_in_valid <= 1'b1;
+            issued_cnt <= issued_cnt + 5'd1;
 
-        S_CALC: begin
-          // x_calc is combinational from u_core; write happens in next state.
-          state <= S_WRITE;
-        end
-
-        S_WRITE: begin
-          x_new[cur_idx] <= x_calc;
-          updated[cur_idx] <= 1'b1;
-
-          // advance slot/group
-          if (slot == 2'd3) begin
-            slot <= 2'd0;
-            if (group == 2'd3) begin
-              group <= 2'd0;
-              // finished one full sweep of 16 variables
-              if (iter_cnt == (M_ITER-1)) begin
-                state <= S_DONE;
-              end else begin
-                iter_cnt <= iter_cnt + 6'd1;
-                state <= S_INIT;
-              end
+            if (slot == 2'd3) begin // done with current slot, core proceed next
+                slot <= 2'd0;
+                if (group == 2'd3) begin // done with last group
+                    group <= 2'd0;
+                end else begin // next group
+                    group <= group + 2'd1;
+                    bubble_cnt <= 2'd2;
+                end 
             end else begin
-              group <= group + 2'd1;
-              state <= S_PREP;
+                slot <= slot + 2'd1;
+            end 
+          end
+
+          // done condition
+          if (commit_cnt == 5'd16 ) begin // done with current iteration
+            if (iter_cnt == M_ITER-1) begin // last iteration
+              state <= DONE;
+            end else begin // next iteration
+                iter_cnt <= iter_cnt + 6'd1;
+                state <= INIT;
             end
-          end else begin
-            slot <= slot + 2'd1;
-            state <= S_PREP;
           end
         end
 
-        S_DONE: begin
-          // Latch x_new to outputs for GSIM to stream out.
+        DONE: begin
+          state <= IDLE;
           x0  <= x_new[0];  x1  <= x_new[1];  x2  <= x_new[2];  x3  <= x_new[3];
           x4  <= x_new[4];  x5  <= x_new[5];  x6  <= x_new[6];  x7  <= x_new[7];
           x8  <= x_new[8];  x9  <= x_new[9];  x10 <= x_new[10]; x11 <= x_new[11];
           x12 <= x_new[12]; x13 <= x_new[13]; x14 <= x_new[14]; x15 <= x_new[15];
           busy <= 1'b0;
           done <= 1'b1;
-          state <= S_IDLE;
         end
-
-        default: state <= S_IDLE;
+        default: state <= IDLE;
       endcase
     end
   end
